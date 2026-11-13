@@ -294,6 +294,7 @@
 
 <script>
   let mode = 'offset'; // 'offset' or 'cursor'
+  const SORT_KEYS = ['latest', 'views', 'oldest'];
   let state = {
     page: 1,
     limit: 10,
@@ -306,6 +307,7 @@
   let currentAbortController = null;
   let debounceTimer = null;
   let loading = false;
+  let typingSession = false;
 
   // 모드 변경 (오프셋 vs 커서)
   function switchMode(newMode) {
@@ -321,11 +323,40 @@
     state.cursor = null;
     state.hasNext = true;
     cursorPosts = [];
-    loadData(true);
+    loadData('push');
+  }
+
+  function buildOffsetQuery() {
+    const q = new URLSearchParams({
+      page: state.page,
+      limit: state.limit,
+      sort: state.sort
+    });
+    if (state.search) q.set('search', state.search);
+    return q.toString();
+  }
+
+  function readStateFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const rawPage = parseInt(params.get('page'), 10);
+    const rawSort = params.get('sort');
+    state.page = rawPage > 0 ? rawPage : 1;
+    state.sort = SORT_KEYS.includes(rawSort) ? rawSort : 'latest';
+    state.search = (params.get('search') || '').trim();
+
+    document.getElementById('searchInput').value = state.search;
+    document.getElementById('sortSelect').value = state.sort;
   }
 
   // 데이터 로드
-  async function loadData(pushHistory = false) {
+  async function loadData(history = null) {
+    if (history === 'typing') {
+      history = typingSession ? 'replace' : 'push';
+      typingSession = true;
+    } else {
+      typingSession = false;
+    }
+
     if (currentAbortController) {
       currentAbortController.abort(); // 이전 진행 요청 즉시 취소
     }
@@ -338,16 +369,13 @@
     let endpoint = '';
 
     if (mode === 'offset') {
-      const q = new URLSearchParams({
-        page: state.page,
-        limit: state.limit,
-        sort: state.sort
-      });
-      if (state.search) q.set('search', state.search);
-      endpoint = `/api/posts?${q.toString()}`;
+      const q = buildOffsetQuery();
+      endpoint = `/api/posts?${q}`;
 
-      if (pushHistory) {
-        window.history.pushState({}, '', `?${q.toString()}`);
+      if (history === 'push') {
+        window.history.pushState({}, '', `?${q}`);
+      } else if (history === 'replace') {
+        window.history.replaceState({}, '', `?${q}`);
       }
     } else {
       const q = new URLSearchParams({ limit: state.limit });
@@ -370,13 +398,23 @@
       document.getElementById('latencyBadge').textContent = `${(t1 - t0).toFixed(2)}ms`;
       document.getElementById('inspectJson').textContent = JSON.stringify(json, null, 2);
 
-      // SQL 미리보기 업데이트
-      updateSqlInspector();
-
       if (mode === 'offset') {
+        state.page = json.meta.page;
+        state.sort = json.meta.sort;
+        document.getElementById('sortSelect').value = state.sort;
+        const canonical = `?${buildOffsetQuery()}`;
+        if (window.location.search !== canonical) {
+          window.history.replaceState({}, '', canonical);
+        }
+
+        // SQL 미리보기 업데이트
+        updateSqlInspector();
         renderTable(json.items);
-        renderPagination(json.meta.page, json.meta.totalPages);
+        renderPagination(json.meta.page, json.meta.totalPages, json.meta.totalCount);
       } else {
+        // SQL 미리보기 업데이트
+        updateSqlInspector();
+
         const base = requestCursor ? cursorPosts : [];
         const byId = new Map([...base, ...json.items].map(p => [p.id, p]));
         cursorPosts = [...byId.values()];
@@ -421,8 +459,12 @@
     `).join('');
   }
 
-  function renderPagination(page, totalPages) {
+  function renderPagination(page, totalPages, totalCount) {
     const bar = document.getElementById('paginationBar');
+    if (totalCount === 0) {
+      bar.innerHTML = '';
+      return;
+    }
     let html = '';
     const start = Math.max(1, page - 3);
     const end = Math.min(totalPages, page + 3);
@@ -433,7 +475,8 @@
     }
     for (let i = start; i <= end; i++) {
       const act = (i === page) ? 'active' : '';
-      html += `<button class="page-btn ${act}" onclick="goToPage(${i})">${i}</button>`;
+      const current = (i === page) ? ' aria-current="page"' : '';
+      html += `<button class="page-btn ${act}"${current} onclick="goToPage(${i})">${i}</button>`;
     }
     if (page < totalPages) {
       html += `<button class="page-btn" onclick="goToPage(${page + 1})">›</button>`;
@@ -444,19 +487,19 @@
 
   function goToPage(p) {
     state.page = p;
-    loadData(true);
+    loadData('push');
   }
 
   function loadMoreCursor() {
     if (loading || !state.hasNext) return;
-    loadData(false);
+    loadData();
   }
 
   function applySearch() {
     state.search = document.getElementById('searchInput').value.trim();
     state.page = 1;
     state.cursor = null;
-    loadData(true);
+    loadData('push');
   }
 
   function updateSqlInspector() {
@@ -485,7 +528,7 @@
       state.search = e.target.value.trim();
       state.page = 1;
       state.cursor = null;
-      loadData(true);
+      loadData('typing');
     }, 300);
   });
 
@@ -493,7 +536,7 @@
     state.sort = e.target.value;
     state.page = 1;
     state.cursor = null;
-    loadData(true);
+    loadData('push');
   });
 
   // 뒤로 가기(popstate) 이벤트 처리
@@ -509,26 +552,14 @@
       cursorPosts = [];
       state.cursor = null;
     }
-    const params = new URLSearchParams(window.location.search);
-    state.page = parseInt(params.get('page'), 10) || 1;
-    state.sort = params.get('sort') || 'latest';
-    state.search = params.get('search') || '';
-
-    document.getElementById('searchInput').value = state.search;
-    document.getElementById('sortSelect').value = state.sort;
-    loadData(false);
+    readStateFromUrl();
+    loadData();
   });
 
   // 초기 로드 시 주소창 파라미터 복원
   window.addEventListener('DOMContentLoaded', () => {
-    const params = new URLSearchParams(window.location.search);
-    state.page = parseInt(params.get('page'), 10) || 1;
-    state.sort = params.get('sort') || 'latest';
-    state.search = params.get('search') || '';
-
-    document.getElementById('searchInput').value = state.search;
-    document.getElementById('sortSelect').value = state.sort;
-    loadData(false);
+    readStateFromUrl();
+    loadData('replace');
   });
 </script>
 </body>
