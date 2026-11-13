@@ -60,6 +60,20 @@ const SORT_WHITELIST = Object.freeze({
   views: (a, b) => (b.views !== a.views ? b.views - a.views : b.id - a.id)
 });
 
+function resolveSortKey(raw) {
+  if (typeof raw !== 'string') return 'latest';
+  return Object.hasOwn(SORT_WHITELIST, raw) ? raw : 'latest';
+}
+
+function normalizeSearch(raw) {
+  return typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+}
+
+function matchSearch(post, search) {
+  if (!search) return true;
+  return post.title.toLowerCase().includes(search) || post.content.toLowerCase().includes(search);
+}
+
 // ==========================================
 // 1. 오프셋 기반 페이지네이션 API
 // GET /api/posts?page=1&limit=10&sort=views&search=인덱스
@@ -72,18 +86,14 @@ app.get('/api/posts', (req, res) => {
   const rawLimit = parseInt(req.query.limit, 10);
   const page = (!isNaN(rawPage) && rawPage > 0) ? rawPage : 1;
   const limit = (!isNaN(rawLimit) && rawLimit > 0) ? Math.min(rawLimit, 100) : 10;
-  const search = (req.query.search || '').trim().toLowerCase();
-  const sortKey = req.query.sort || 'latest';
+  const search = normalizeSearch(req.query.search);
+  const sortKey = resolveSortKey(req.query.sort);
 
   // 1) 검색 필터링 (WHERE title LIKE '%search%')
-  let filtered = POSTS.filter(p => {
-    if (!search) return true;
-    return p.title.toLowerCase().includes(search) || p.content.toLowerCase().includes(search);
-  });
+  const filtered = POSTS.filter(p => matchSearch(p, search));
 
   // 2) 화이트리스트 정렬 (ORDER BY ...)
-  const sortComparator = SORT_WHITELIST[sortKey] || SORT_WHITELIST.latest;
-  filtered.sort(sortComparator);
+  filtered.sort(SORT_WHITELIST[sortKey]);
 
   // 3) 오프셋 계산 및 데이터 슬라이싱
   const totalCount = filtered.length;
@@ -105,6 +115,8 @@ app.get('/api/posts', (req, res) => {
       totalPages,
       hasNext: safePage < totalPages,
       hasPrev: safePage > 1,
+      sort: sortKey,
+      search,
       executionTimeMs: Number(executionTimeMs)
     }
   });
@@ -119,12 +131,14 @@ app.get('/api/posts/cursor', (req, res) => {
 
   const rawCursor = parseInt(req.query.cursor, 10);
   const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 10), 50);
+  const search = normalizeSearch(req.query.search);
+  const hasCursor = !isNaN(rawCursor) && rawCursor > 0;
 
   // 커서가 있으면 해당 id보다 작은 항목들만 탐색 (WHERE id < ? ORDER BY id DESC)
-  let candidate = POSTS;
-  if (!isNaN(rawCursor) && rawCursor > 0) {
-    candidate = POSTS.filter(p => p.id < rawCursor);
-  }
+  const candidate = POSTS
+    .filter(p => matchSearch(p, search))
+    .filter(p => !hasCursor || p.id < rawCursor)
+    .sort((a, b) => b.id - a.id);
 
   // limit + 1개를 조회하여 다음 데이터 존재 여부(hasNext) 판단 (COUNT(*) 제거)
   const sliced = candidate.slice(0, limit + 1);
@@ -139,10 +153,12 @@ app.get('/api/posts/cursor', (req, res) => {
   res.json({
     items,
     meta: {
-      cursor: rawCursor || null,
+      cursor: hasCursor ? rawCursor : null,
       nextCursor,
       limit,
       hasNext,
+      search,
+      sort: 'id_desc',
       executionTimeMs: Number(executionTimeMs)
     }
   });
